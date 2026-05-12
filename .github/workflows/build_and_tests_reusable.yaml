@@ -2,6 +2,13 @@ name: '_build-and-tests'
 on:
   workflow_call:
 
+# Default-deny: jobs that need write scopes must opt up explicitly.
+# Prevents the GitHub Actions Cache poisoning + OIDC-token-write
+# attack chain documented in the May 2026 TanStack supply-chain
+# compromise.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0 # TODO: remove this when we cache the builds

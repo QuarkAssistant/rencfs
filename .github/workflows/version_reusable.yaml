@@ -6,6 +6,13 @@ on:
         description: 'Version from Cargo.toml'
         value: ${{ jobs.version.outputs.version }}
 
+# Default-deny: jobs that need write scopes must opt up explicitly.
+# Prevents the GitHub Actions Cache poisoning + OIDC-token-write
+# attack chain documented in the May 2026 TanStack supply-chain
+# compromise.
+permissions:
+  contents: read
+
 jobs:
   version:
     runs-on: ubuntu-latest

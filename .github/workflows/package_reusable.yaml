@@ -11,6 +11,13 @@ on:
         type: string
         required: true
 
+# Default-deny: jobs that need write scopes must opt up explicitly.
+# Prevents the GitHub Actions Cache poisoning + OIDC-token-write
+# attack chain documented in the May 2026 TanStack supply-chain
+# compromise.
+permissions:
+  contents: read
+
 jobs:
   aur_build:
     name: build AUR
