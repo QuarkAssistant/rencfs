@@ -9,7 +9,8 @@ added. It intentionally does **not** claim that rencfs mounts on Windows today.
 
 ## Recommendation
 
-Use [WinFsp](https://winfsp.dev/) as the native Windows mount backend.
+Investigate [WinFsp](https://winfsp.dev/) as the preferred native Windows mount
+backend, conditional on resolving both licensing checkpoints below.
 
 Reasons:
 
@@ -20,32 +21,60 @@ Reasons:
 - WinFsp supports the drive-letter/directory-mount workflow expected by Windows
   users, while letting rencfs keep its existing encrypted storage layer.
 
-A WebDAV, Dokan, or WSL-only route is less attractive:
+WinFsp is the preferred native backend **only if the licensing gates below can
+be resolved**. Alternatives remain viable and should be compared by their real
+constraints rather than ruled out as incapable:
 
-- WebDAV would change filesystem semantics and add a network server surface.
-- Dokan is viable, but rencfs already has a FUSE-like design that maps more
-  directly to WinFsp.
-- WSL is useful for development, but it is not native Windows support.
+| Route | Why it is not the first choice here | Licensing / decision checkpoint |
+| --- | --- | --- |
+| [WinFsp](https://winfsp.dev/) | Familiar FUSE-like host with Rust bindings and drive/directory mounts. | Driver/library GPLv3 + FLOSS exception or commercial terms; Rust bindings require a separate review. |
+| [Dokany](https://github.com/dokan-dev/dokany#license) | Viable native driver-backed filesystem; requires a different callback adapter and separate Rust-binding assessment. This note has not measured the relative Rust ecosystems. | User-mode library LGPL with a static-linking exception; driver MIT. Verify the selected Rust wrapper separately. |
+| [ProjFS](https://learn.microsoft.com/en-us/windows/win32/projfs/projected-file-system) | A projected directory with on-demand hydration and local full-file state, rather than the same custom mounted-filesystem interface. It is **not inherently read-only**: local creates, renames and writes exist. | Built-in optional Windows component, no custom driver; assess notifications and local-state ownership. Hydrated/full files introduce plaintext-at-rest concerns unlike the encrypted backing-store contract. |
+| [Cloud Files API](https://learn.microsoft.com/en-us/windows/win32/cfapi/build-a-cloud-file-sync-engine) | Designed around sync roots, placeholders and a sync provider, not a drop-in encrypted-volume adapter. Hydration/local caching needs a separate plaintext-at-rest design. | Windows API and sync-provider integration requirements; no assumption that this gives WinFsp-like callback semantics. |
+| WSL passthrough | Can reuse the Linux FUSE backend but adds a Linux environment and cross-boundary file access; not a native Windows mount. | Linux backend/deployment requirements still apply. |
+| WebDAV | Adds an HTTP service and client/network-filesystem semantics rather than preserving local filesystem behavior. | Server/client dependencies and security surface require their own review. |
 
 ## Licensing checkpoint
 
-WinFsp is GPLv3 with a FLOSS exception, and commercial licenses are available.
-Because rencfs is currently `MIT OR Apache-2.0`, this should be treated as an
-explicit maintainer decision before shipping binaries.
+There are two independent checkpoints, not one:
 
-If rencfs links to or redistributes WinFsp under the FLOSS exception, user-facing
-docs and any UI should include the WinFsp attribution required by the exception:
+1. **WinFsp driver/library.** The [WinFsp license](https://github.com/winfsp/winfsp/blob/master/License.txt)
+   is GPLv3 with a FLOSS exception; commercial terms are also available. Review
+   the exact exception and distribution terms for the chosen WinFsp release.
+2. **Rust bindings.** The `winfsp` crate is a separate dependency. As checked on
+   2026-10-27, crates.io reports `license: "GPL-3.0"` for both
+   [`0.12.6+winfsp-2.1`](https://crates.io/api/v1/crates/winfsp/0.12.6%2Bwinfsp-2.1)
+   (the proposed 0.12 line) and
+   [`0.13.2+winfsp-2.1`](https://crates.io/api/v1/crates/winfsp/0.13.2%2Bwinfsp-2.1).
+   The repository's
+   [`LICENSE.md`](https://github.com/SnowflakePowered/winfsp-rs/blob/0cdd86a6f1ecd38c89da6ccf3fe2fc3312e11d8f/LICENSE.md)
+   contains the GPLv3 text, without a WinFsp-style FLOSS linking exception.
+   Missing registry metadata would not establish permission either; read the
+   selected release's actual sources and license, including `winfsp-sys`.
+
+Because rencfs is `MIT OR Apache-2.0`, the binding's GPL terms remain an
+**implementation blocker** for the proposed dependency shape until maintainers
+choose a supported licensing/distribution approach or another binding/backend.
+This is not a claim that the combination is impossible; it is not cleared by
+this research note. A commercial license or FLOSS exception for the WinFsp
+library does not grant an exception for separately authored Rust bindings.
+Do not add or ship the dependency on the assumption that attribution is enough.
+
+If the selected WinFsp FLOSS exception applies, user-facing docs and any UI must
+also carry its required attribution (preserved here):
 
 > WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
 > https://github.com/winfsp/winfsp
 
-The first implementation PR can avoid redistribution by requiring users and CI
-to install WinFsp separately, but dependency licensing should still be reviewed
-before release packaging.
+Requiring users and CI to install WinFsp separately avoids bundling that driver;
+it does not settle the license of Rust binding code linked into rencfs.
+Maintainers must resolve both checkpoints before implementation/distribution.
 
-## Proposed dependency shape
+## Proposed dependency shape (conditional on licensing clearance)
 
-Add the dependency only for Windows targets:
+The following is an API/build sketch, **not an approved dependency addition**.
+If the licensing gate is resolved for these bindings, add them only for Windows
+targets:
 
 ```toml
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -140,11 +169,68 @@ Unsupported initially:
 - extended attributes;
 - hard links;
 - Windows ACL preservation beyond a simple default descriptor;
-- case-insensitive lookup compatibility if encrypted names remain
-  case-sensitive.
+- case-insensitive alias lookup or automatic case folding.
 
 These should return clear unsupported-operation errors until the storage layer
 has matching semantics.
+
+### Case-sensitive volume policy
+
+The encrypted store distinguishes `Foo` and `foo`. Preserve that identity rather
+than merging entries or changing the on-disk name format. Configure
+`FSP_FSCTL_VOLUME_PARAMS.CaseSensitiveSearch = TRUE`
+(`VolumeParams::case_sensitive_search(true)` in the proposed Rust host API) and
+`CasePreservedNames = TRUE` before starting the host. See the
+[WinFsp volume-parameter definition](https://github.com/winfsp/winfsp/blob/master/inc/winfsp/fsctl.h)
+and the [Rust volume parameters](https://docs.rs/winfsp/0.12.6+winfsp-2.1/winfsp/host/struct.VolumeParams.html).
+Do not advertise case-insensitive lookup, lowercase incoming names, or build a
+case-folded index that silently aliases distinct encrypted entries.
+
+This is a proposed adapter contract, not a claim of full Windows compatibility.
+Some Windows clients do not request case-sensitive opens; Explorer, installers
+and applications that assume case-insensitive paths need testing and may fail or
+be unable to distinguish both names. Flag that limitation in the README instead
+of promising NTFS-like case-insensitive behavior. Before accepting an adapter,
+test exact-case lookup, create, enumerate and rename of both `Foo` and `foo`,
+remount persistence, and representative Win32 clients on an actual Windows host.
+
+### Reserved and unrepresentable names
+
+Apply a single component validator to create and rename destinations and to
+lookups that reach the adapter. Follow the
+[Windows naming rules](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file):
+
+- Reject `< > : " / \\ | ? *`, NUL and control characters U+0001..U+001F.
+  Separators delimit paths; they are never part of a filename component. A colon
+  must not accidentally enable an unsupported alternate data stream.
+- Reject the case-insensitive device names `CON`, `PRN`, `AUX`, `NUL`,
+  `COM1`..`COM9`, `LPT1`..`LPT9`, including extensions such as `NUL.txt` and
+  the documented superscript-digit device forms. Treat `.` and `..` as path
+  syntax, never new entry names.
+- Reject trailing dots or spaces; do not trim them into a different stored name.
+- Preserve representable Unicode without lossy UTF-8/UTF-16 conversion. Document
+  and reject any name the selected API/storage conversion cannot represent.
+
+Return `STATUS_OBJECT_NAME_INVALID` for invalid names that reach callbacks,
+not a misleading not-found response (`STATUS_OBJECT_NAME_NOT_FOUND`). Valid but
+absent names still get the appropriate not-found error. Win32 may normalize or
+reject paths before invoking the filesystem; the adapter cannot promise that
+all client requests will reach this validator.
+
+Linux-created encrypted data can already contain incompatible names. The first
+Windows implementation should preflight the decrypted namespace and refuse the
+mount with an actionable incompatibility report if those names cannot be exposed
+faithfully. Keep any decrypted-name diagnostic local, opt-in and outside routine
+logs. Do not silently rename, trim, delete, hide or rewrite backing entries.
+A lossless escaping/alias scheme would be a separate on-disk/API design decision,
+not an implicit workaround in lookup. Until then, rename incompatible entries
+through the Linux mount before using that data on Windows.
+
+Required future adapter tests: each forbidden-character class, trailing-dot and
+trailing-space names, mixed-case device names with and without extensions,
+create/rename/lookup error mapping, unchanged backing entries after rejection,
+and an existing Linux-created incompatible namespace. These are proposed tests,
+not evidence of current Windows runtime support.
 
 ## Windows metadata decisions
 
@@ -160,6 +246,38 @@ Recommended first pass:
 - Set a default security descriptor for the mounted volume instead of trying to
   round-trip arbitrary ACLs.
 - Document that ACL preservation is not part of the first milestone.
+
+### FILETIME conversion contract
+
+WinFsp file-info timestamps use Windows
+[`FILETIME`](https://learn.microsoft.com/en-us/windows/win32/sysinfo/file-times):
+unsigned 64-bit **100-nanosecond** ticks since **1601-01-01 00:00:00 UTC**,
+not nanoseconds or seconds since 1970. The epoch offset is exactly
+`11644473600` seconds. Map `crtime` to creation, `atime` to last access, `mtime`
+to last write, and `ctime` to metadata change time.
+
+Centralize both directions in one checked conversion layer. With signed,
+normalized Unix seconds and `0 <= unix_nanos < 1_000_000_000`:
+
+```text
+filetime_ticks = (unix_secs + 11644473600) * 10_000_000 + unix_nanos / 100
+unix_secs      = filetime_ticks / 10_000_000 - 11644473600
+unix_nanos     = (filetime_ticks % 10_000_000) * 100
+```
+
+Use a wide signed intermediate and checked arithmetic before narrowing. Normalize
+pre-1970 `SystemTime` values correctly instead of unwrapping `duration_since` or
+using an absolute duration. Reject dates before 1601 and overflow/unrepresentable
+values with an explicit invalid-parameter error, not wrapping or clamping. The
+forward conversion truncates to 100 ns precision; a reverse/forward round-trip
+must preserve every representable tick. Honor callback-specific timestamp setter
+sentinels separately from ordinary timestamps.
+
+Required future adapter tests (not implemented or claimed by this research PR):
+1601 epoch -> 0; Unix epoch -> 116444736000000000; a pre-1970 date; leap day;
+subsecond values on both sides of a second boundary; a representable modern-date
+round-trip; and underflow/overflow of both the tick and rencfs time types. Prove
+that any precision loss is less than 100 ns, and separately test setter sentinels.
 
 ## Build and CI plan
 
@@ -223,6 +341,12 @@ are readable and that `data` does not contain plaintext filenames or contents.
 A first implementation PR should be considered ready only when it can truthfully
 check these boxes:
 
+- Maintainers have resolved the WinFsp and Rust-binding licensing checkpoints;
+  installing WinFsp separately is not treated as blanket clearance.
+- FILETIME epoch/precision/bounds tests and case-sensitive-name round-trips pass.
+- Invalid-name create/rename/lookup tests pass without mutating backing entries;
+  incompatible Linux-created namespaces get the documented preflight failure.
+- The README explains case-sensitive Windows client limitations.
 - The project builds on `windows-latest` with the Windows backend enabled.
 - The PR does not add a separate Windows CLI surface unless justified.
 - Unsupported operations return explicit errors, not success placeholders.
